@@ -21,7 +21,23 @@ jobs:
       - name: Install Playwright browsers
         run: playwright install --with-deps chromium
 
+      # Restore state.json from previous run (if it exists)
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: ticket-state-${{ github.run_id }}
+          restore-keys: ticket-state-
+
       - name: Check ticket availability
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python ticket_checker.py
+
+      # Always save state.json so the next run can load it
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: ticket-state-${{ github.run_id }}

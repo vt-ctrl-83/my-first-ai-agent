@@ -18,9 +18,10 @@ TICKETS = {
     "🎟️  24h Colosseum":         "24h-colosseo-foro-romano-palatino",
 }
 
-NTFY_TOPIC = os.environ["NTFY_TOPIC"]
-BASE       = "https://ticketing.colosseo.it/en/eventi/"
-UTC_OFFSET = timedelta(hours=2)
+NTFY_TOPIC  = os.environ["NTFY_TOPIC"]
+STATE_FILE  = "state.json"
+BASE        = "https://ticketing.colosseo.it/en/eventi/"
+UTC_OFFSET  = timedelta(hours=2)
 
 PAUZE_TUSSEN_TICKETS = 30
 PAUZE_TUSSEN_MAANDEN = 15
@@ -65,11 +66,79 @@ STEALTH = """
 """
 
 
+# ─── STATE ───────────────────────────────────────────────────────────────────
+
+def laad_staat():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return {tuple(k.split("|")): v for k, v in json.load(f).items()}
+    return {}
+
+
+def sla_staat_op(hits):
+    staat = {f"{h['ticket']}|{h['datum']}": h["vrije"] for h in hits}
+    with open(STATE_FILE, "w") as f:
+        json.dump(staat, f)
+
+
+def bereken_delta(hits_nu, vorige_staat):
+    nu = {(h["ticket"], h["datum"]): h for h in hits_nu}
+
+    nieuw     = [h for k, h in nu.items() if k not in vorige_staat]
+    meer      = [h for k, h in nu.items()
+                 if k in vorige_staat and h["vrije"] > vorige_staat[k]]
+    verdwenen = [k for k in vorige_staat if k not in nu]
+
+    return nieuw, meer, verdwenen
+
+
+# ─── NOTIFICATION ────────────────────────────────────────────────────────────
+
+def stuur_notificatie(hits, label, priority="urgent", tags="rotating_light,ticket"):
+    for h in hits:
+        tijden  = ", ".join(s.strip().split("—")[0].strip() for s in h["slots"]) or "?"
+        bericht = f"{h['datum']} · {h['vrije']} plaatsen · {tijden}\n{h['url']}"
+        try:
+            requests.post(
+                f"https://ntfy.sh/{NTFY_TOPIC}",
+                data=bericht.encode("utf-8"),
+                headers={
+                    "Title":    f"{label}: {h['ticket'].strip()}",
+                    "Priority": priority,
+                    "Tags":     tags,
+                },
+                timeout=10,
+            )
+            print(f"  📱 [{label}] {h['ticket'].strip()} {h['datum']}")
+        except Exception as e:
+            print(f"  📱 Notificatie mislukt: {e}")
+
+
+def stuur_verdwenen(verdwenen_keys):
+    for ticket, datum in verdwenen_keys:
+        bericht = f"{ticket.strip()} op {datum} is niet meer beschikbaar."
+        try:
+            requests.post(
+                f"https://ntfy.sh/{NTFY_TOPIC}",
+                data=bericht.encode("utf-8"),
+                headers={
+                    "Title":    f"❌ Weg: {ticket.strip()}",
+                    "Priority": "default",
+                    "Tags":     "x",
+                },
+                timeout=10,
+            )
+            print(f"  📱 [Weg] {ticket.strip()} {datum}")
+        except Exception as e:
+            print(f"  📱 Notificatie mislukt: {e}")
+
+
+# ─── SCRAPER ─────────────────────────────────────────────────────────────────
+
 def groepeer_per_maand(dates):
     maanden = {}
     for datum in dates:
-        maand = datum[:7]
-        maanden.setdefault(maand, []).append(datum)
+        maanden.setdefault(datum[:7], []).append(datum)
     return maanden
 
 
@@ -79,8 +148,8 @@ def verwerk_slots(slots, datums):
         vrije_slots = []
         for s in slots:
             if datum in s.get("startDateTime", "") and s.get("capacity", 0) > 0:
-                utc_tijd     = datetime.strptime(s["startDateTime"], "%Y-%m-%dT%H:%M:%SZ")
-                italie_tijd  = utc_tijd + UTC_OFFSET
+                utc_tijd    = datetime.strptime(s["startDateTime"], "%Y-%m-%dT%H:%M:%SZ")
+                italie_tijd = utc_tijd + UTC_OFFSET
                 vrije_slots.append(f"  {italie_tijd.strftime('%H:%M')} — {s['capacity']} plaatsen")
         vrije_totaal = sum(
             s.get("capacity", 0) for s in slots
@@ -88,26 +157,6 @@ def verwerk_slots(slots, datums):
         )
         resultaten[datum] = (vrije_totaal, vrije_slots)
     return resultaten
-
-
-def stuur_notificatie(hits):
-    for h in hits:
-        tijden = ", ".join(s.strip().split("—")[0].strip() for s in h["slots"]) or "?"
-        bericht = f"{h['datum']} · {h['vrije']} plaatsen · {tijden}\n{h['url']}"
-        try:
-            requests.post(
-                f"https://ntfy.sh/{NTFY_TOPIC}",
-                data=bericht.encode("utf-8"),
-                headers={
-                    "Title":    f"Colosseum beschikbaar: {h['ticket'].strip()}",
-                    "Priority": "urgent",
-                    "Tags":     "rotating_light,ticket",
-                },
-                timeout=10,
-            )
-            print(f"  📱 Notificatie verstuurd: {h['ticket'].strip()} {h['datum']}")
-        except Exception as e:
-            print(f"  📱 Notificatie mislukt: {e}")
 
 
 async def haal_data_voor_ticket(playwright, slug, maanden):
@@ -140,11 +189,16 @@ async def haal_data_voor_ticket(playwright, slug, maanden):
     return resultaten
 
 
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+
 async def run():
     print("=" * 55)
     print("  🏛️  Colosseum Ticket Checker")
     print(f"  📅  {DATES[0]} t/m {DATES[-1]}")
     print("=" * 55)
+
+    vorige_staat = laad_staat()
+    print(f"  📂 Vorige staat: {len(vorige_staat)} slot(s) bekend\n")
 
     maanden = groepeer_per_maand(DATES)
     hits    = []
@@ -187,11 +241,22 @@ async def run():
 
             await asyncio.sleep(PAUZE_TUSSEN_TICKETS)
 
-    if hits:
-        print(f"\n  📊 {len(hits)} beschikbare slot(s) gevonden — notificaties versturen...")
-        stuur_notificatie(hits)
-    else:
-        print("\n  ✓ Geen beschikbaarheid gevonden.")
+    # Delta
+    nieuw, meer, verdwenen = bereken_delta(hits, vorige_staat)
+
+    print(f"\n  📊 Delta: {len(nieuw)} nieuw · {len(meer)} meer plaatsen · {len(verdwenen)} weg")
+
+    if nieuw:
+        stuur_notificatie(nieuw, "🆕 Nieuw")
+    if meer:
+        stuur_notificatie(meer, "📈 Meer plaatsen", priority="high", tags="chart_increasing")
+    if verdwenen:
+        stuur_verdwenen(verdwenen)
+    if not nieuw and not meer and not verdwenen:
+        print("  ✓ Geen wijzigingen.")
+
+    sla_staat_op(hits)
+    print("  💾 Staat opgeslagen.")
 
 
 if __name__ == "__main__":
