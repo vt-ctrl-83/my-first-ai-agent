@@ -23,6 +23,5 @@ jobs:
 
       - name: Check ticket availability
         env:
-          GMAIL:        ${{ secrets.GMAIL }}
-          GMAIL_APP_PW: ${{ secrets.GMAIL_APP_PW }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python ticket_checker.py

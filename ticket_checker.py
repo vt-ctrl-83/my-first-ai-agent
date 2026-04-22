@@ -1,9 +1,8 @@
 import asyncio
 import json
 import os
-import smtplib
+import requests
 from datetime import datetime, timedelta
-from email.mime.text import MIMEText
 from playwright.async_api import async_playwright
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
@@ -19,8 +18,7 @@ TICKETS = {
     "🎟️  24h Colosseum":         "24h-colosseo-foro-romano-palatino",
 }
 
-GMAIL      = os.environ["GMAIL"]
-APP_PW     = os.environ["GMAIL_APP_PW"]
+NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 BASE       = "https://ticketing.colosseo.it/en/eventi/"
 UTC_OFFSET = timedelta(hours=2)
 
@@ -92,35 +90,24 @@ def verwerk_slots(slots, datums):
     return resultaten
 
 
-def stuur_mail(hits):
-    regels = [f"Controle: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"]
+def stuur_notificatie(hits):
     for h in hits:
-        regels += [
-            "─" * 40,
-            f"Ticket: {h['ticket']}",
-            f"Datum:  {h['datum']}",
-            f"Totaal: {h['vrije']} plaatsen",
-            "Tijdsloten:",
-            *h["slots"],
-            f"Boek nu: {h['url']}",
-            "",
-        ]
-
-    body      = "\n".join(regels)
-    onderwerp = f"🏛️ Colosseum beschikbaar — {len(hits)} slot(s) gevonden"
-
-    msg           = MIMEText(body)
-    msg["From"]   = GMAIL
-    msg["To"]     = GMAIL
-    msg["Subject"] = onderwerp
-
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(GMAIL, APP_PW)
-            s.send_message(msg)
-        print(f"  📧 Mail verstuurd! ({len(hits)} slot(s))")
-    except Exception as e:
-        print(f"  📧 E-mail mislukt: {e}")
+        tijden = ", ".join(s.strip().split("—")[0].strip() for s in h["slots"]) or "?"
+        bericht = f"{h['datum']} · {h['vrije']} plaatsen · {tijden}\n{h['url']}"
+        try:
+            requests.post(
+                f"https://ntfy.sh/{NTFY_TOPIC}",
+                data=bericht.encode("utf-8"),
+                headers={
+                    "Title":    f"Colosseum beschikbaar: {h['ticket'].strip()}",
+                    "Priority": "urgent",
+                    "Tags":     "rotating_light,ticket",
+                },
+                timeout=10,
+            )
+            print(f"  📱 Notificatie verstuurd: {h['ticket'].strip()} {h['datum']}")
+        except Exception as e:
+            print(f"  📱 Notificatie mislukt: {e}")
 
 
 async def haal_data_voor_ticket(playwright, slug, maanden):
@@ -201,8 +188,8 @@ async def run():
             await asyncio.sleep(PAUZE_TUSSEN_TICKETS)
 
     if hits:
-        print(f"\n  📊 {len(hits)} beschikbare slot(s) gevonden — mail versturen...")
-        stuur_mail(hits)
+        print(f"\n  📊 {len(hits)} beschikbare slot(s) gevonden — notificaties versturen...")
+        stuur_notificatie(hits)
     else:
         print("\n  ✓ Geen beschikbaarheid gevonden.")
 
