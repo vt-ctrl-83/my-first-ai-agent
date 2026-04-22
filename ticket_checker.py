@@ -150,25 +150,49 @@ async def haal_data_voor_ticket(playwright, slug, maanden):
     try:
         for maand, datums in maanden.items():
             url = f"{BASE}{slug}/?date={datums[0]}"
-            raw = None
+            gevangen = []  # (response_url, text)
+
+            async def vang_response(response):
+                content_type = response.headers.get("content-type", "")
+                if "json" in content_type and response.status == 200:
+                    try:
+                        tekst = await response.text()
+                        gevangen.append((response.url, tekst))
+                        print(f"  🔍 JSON: {response.url}")
+                    except Exception:
+                        pass
+
+            page.on("response", vang_response)
             try:
-                # Use Playwright's native response interception — catches both XHR and fetch
-                async with page.expect_response(
-                    lambda r: "calendars_month" in r.url and r.status == 200,
-                    timeout=30000,
-                ) as resp_info:
-                    await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-
-                resp = await resp_info.value
-                raw  = await resp.text()
-                print(f"  ✔ API gevangen voor {slug} / {maand}: {resp.url}")
-
-                if raw.strip().startswith("<!"):
-                    print(f"  ⚠️  HTML ontvangen i.p.v. JSON voor {slug} / {maand}")
-                    raw = None
-
+                await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                await asyncio.sleep(8)  # wacht op lazy API-calls
+                await page.evaluate("window.scrollTo(0, 500)")
+                await asyncio.sleep(3)
             except Exception as e:
-                print(f"  ⚠️  Geen API-response voor {slug} / {maand}: {e}")
+                print(f"  ⚠️  Pagina laad-fout {slug} / {maand}: {e}")
+            page.remove_listener("response", vang_response)
+
+            # Screenshot als artifact voor debugging
+            screenshot = f"debug_{slug[:25]}_{maand}.png"
+            await page.screenshot(path=screenshot)
+            print(f"  📸 Screenshot: {screenshot}")
+
+            # Zoek kalenderdata op basis van bekende URL-patronen
+            KALENDER_PATRONEN = ["calendar", "slot", "availability", "month", "event"]
+            raw = None
+            for resp_url, tekst in gevangen:
+                if any(p in resp_url.lower() for p in KALENDER_PATRONEN):
+                    raw = tekst
+                    print(f"  ✔ Kalender-URL gevonden: {resp_url}")
+                    break
+
+            if raw is None:
+                if gevangen:
+                    print(f"  ℹ️  Alle JSON-URLs voor {slug} / {maand}:")
+                    for resp_url, _ in gevangen:
+                        print(f"       {resp_url}")
+                else:
+                    print(f"  ⚠️  Geen enkele JSON-response voor {slug} / {maand}")
 
             resultaten[maand] = (raw, datums)
             await asyncio.sleep(PAUZE_TUSSEN_MAANDEN)
