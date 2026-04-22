@@ -7,6 +7,9 @@ from playwright.async_api import async_playwright
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 DATES = [
+    # Test: mei 2026 (dichtbij, makkelijk te verifiëren)
+    "2026-05-01", "2026-05-02", "2026-05-03",
+    # Target: juni week 22-28
     "2026-06-22", "2026-06-23", "2026-06-24",
     "2026-06-25", "2026-06-26", "2026-06-27", "2026-06-28",
 ]
@@ -27,24 +30,6 @@ PAUZE_TUSSEN_TICKETS = 30
 PAUZE_TUSSEN_MAANDEN = 15
 PAUZE_VOOR_24H       = 60
 # ─────────────────────────────────────────────────────────────────────────────
-
-XHR_SCRIPT = """
-    window.__calendarData = null;
-    const origOpen = XMLHttpRequest.prototype.open;
-    const origSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(method, url, ...args) {
-        this.__url = url;
-        return origOpen.call(this, method, url, ...args);
-    };
-    XMLHttpRequest.prototype.send = function(...args) {
-        this.addEventListener('load', function() {
-            if (this.__url && this.__url.includes('calendars_month')) {
-                window.__calendarData = this.responseText;
-            }
-        });
-        return origSend.call(this, ...args);
-    };
-"""
 
 BROWSER_ARGS = {
     "headless": True,
@@ -82,13 +67,10 @@ def sla_staat_op(hits):
 
 
 def bereken_delta(hits_nu, vorige_staat):
-    nu = {(h["ticket"], h["datum"]): h for h in hits_nu}
-
+    nu        = {(h["ticket"], h["datum"]): h for h in hits_nu}
     nieuw     = [h for k, h in nu.items() if k not in vorige_staat]
-    meer      = [h for k, h in nu.items()
-                 if k in vorige_staat and h["vrije"] > vorige_staat[k]]
+    meer      = [h for k, h in nu.items() if k in vorige_staat and h["vrije"] > vorige_staat[k]]
     verdwenen = [k for k in vorige_staat if k not in nu]
-
     return nieuw, meer, verdwenen
 
 
@@ -116,11 +98,10 @@ def stuur_notificatie(hits, label, priority="urgent", tags="rotating_light,ticke
 
 def stuur_verdwenen(verdwenen_keys):
     for ticket, datum in verdwenen_keys:
-        bericht = f"{ticket.strip()} op {datum} is niet meer beschikbaar."
         try:
             requests.post(
                 f"https://ntfy.sh/{NTFY_TOPIC}",
-                data=bericht.encode("utf-8"),
+                data=f"{ticket.strip()} op {datum} is niet meer beschikbaar.".encode("utf-8"),
                 headers={
                     "Title":    f"❌ Weg: {ticket.strip()}",
                     "Priority": "default",
@@ -168,20 +149,28 @@ async def haal_data_voor_ticket(playwright, slug, maanden):
 
     try:
         for maand, datums in maanden.items():
-            await page.add_init_script(XHR_SCRIPT)
             url = f"{BASE}{slug}/?date={datums[0]}"
+            raw = None
             try:
-                await page.goto(url, timeout=60000, wait_until="networkidle")
-                raw = None
-                for _ in range(20):
-                    await asyncio.sleep(1)
-                    raw = await page.evaluate("window.__calendarData")
-                    if raw and not raw.strip().startswith("<!"):
-                        break
-                resultaten[maand] = (raw, datums)
+                # Use Playwright's native response interception — catches both XHR and fetch
+                async with page.expect_response(
+                    lambda r: "calendars_month" in r.url and r.status == 200,
+                    timeout=30000,
+                ) as resp_info:
+                    await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+
+                resp = await resp_info.value
+                raw  = await resp.text()
+                print(f"  ✔ API gevangen voor {slug} / {maand}: {resp.url}")
+
+                if raw.strip().startswith("<!"):
+                    print(f"  ⚠️  HTML ontvangen i.p.v. JSON voor {slug} / {maand}")
+                    raw = None
+
             except Exception as e:
-                print(f"  ⚠️  Fout bij laden {slug} / {maand}: {e}")
-                resultaten[maand] = (None, datums)
+                print(f"  ⚠️  Geen API-response voor {slug} / {maand}: {e}")
+
+            resultaten[maand] = (raw, datums)
             await asyncio.sleep(PAUZE_TUSSEN_MAANDEN)
     finally:
         await browser.close()
@@ -241,9 +230,7 @@ async def run():
 
             await asyncio.sleep(PAUZE_TUSSEN_TICKETS)
 
-    # Delta
     nieuw, meer, verdwenen = bereken_delta(hits, vorige_staat)
-
     print(f"\n  📊 Delta: {len(nieuw)} nieuw · {len(meer)} meer plaatsen · {len(verdwenen)} weg")
 
     if nieuw:
